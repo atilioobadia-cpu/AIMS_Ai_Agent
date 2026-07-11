@@ -20,8 +20,16 @@ const starterPrompts = [
   { icon: " ", text: "SDL applies to companies with how many employees?" },
 ];
 
+const calculatorPrompts = [
+  { icon: " ", text: "Calculate PAYE for TZS 600,000 monthly income", type: "paye" as const },
+  { icon: " ", text: "What is 18% VAT on TZS 1,000,000?", type: "vat" as const },
+  { icon: " ", text: "Calculate SDL for TZS 5,000,000 payroll with 12 employees", type: "sdl" as const },
+  { icon: " ", text: "Calculate WHT on TZS 2,000,000 management fee", type: "wht" as const },
+];
+
 export default function Home() {
-  const [view, setView] = useState<"chat" | "calculator" | "documents">("chat");
+  const [mounted, setMounted] = useState(false);
+  const [view, setView] = useState<"chat" | "documents">("chat");
   const [documents, setDocuments] = useState<StoredDocument[]>([]);
   const [isSending, setIsSending] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -29,24 +37,32 @@ export default function Home() {
   const transcriptRef = useRef<HTMLDivElement>(null);
 
   const {
-    conversations,
     activeConversationId,
     getActiveConversation,
     createConversation,
     setActiveConversation,
     addMessage,
-    updateLastAssistantMessage,
     deleteConversation,
-    renameConversation,
     getSortedConversations,
   } = useConversationStore();
 
   const activeConversation = getActiveConversation();
   const sortedConversations = getSortedConversations();
 
+  // Fix hydration: only render after client mount
   useEffect(() => {
-    void loadDocuments();
+    setMounted(true);
+    // Start collapsed on mobile
+    if (window.innerWidth <= 900) {
+      setSidebarOpen(false);
+    }
   }, []);
+
+  useEffect(() => {
+    if (mounted) {
+      void loadDocuments();
+    }
+  }, [mounted]);
 
   useEffect(() => {
     if (transcriptRef.current) {
@@ -72,6 +88,58 @@ export default function Home() {
     setView("chat");
   }
 
+  function detectCalculatorRequest(text: string): { type: string; params: Record<string, number | string> } | null {
+    const lower = text.toLowerCase();
+
+    // PAYE detection
+    if (/\b(paye|income\s*tax|pay\s*as\s*you\s*earn)\b/i.test(text)) {
+      const numMatch = text.match(/[\d,]+/);
+      const amount = numMatch ? parseInt(numMatch[0].replace(/,/g, ""), 10) : 600000;
+      return { type: "paye", params: { monthlyTaxableIncome: amount } };
+    }
+
+    // VAT detection
+    if (/\b(vat|value\s*added\s*tax|ongezeko)\b/i.test(text)) {
+      const numMatch = text.match(/[\d,]+/);
+      const amount = numMatch ? parseInt(numMatch[0].replace(/,/g, ""), 10) : 1000000;
+      return { type: "vat", params: { amount, mode: "exclusive" } };
+    }
+
+    // SDL detection
+    if (/\b(sdl|skills\s*development)\b/i.test(text)) {
+      const numbers = text.match(/[\d,]+/g) || [];
+      const payroll = numbers[0] ? parseInt(numbers[0].replace(/,/g, ""), 10) : 5000000;
+      const employees = numbers[1] ? parseInt(numbers[1], 10) : 12;
+      return { type: "sdl", params: { totalGrossEmoluments: payroll, employeeCount: employees } };
+    }
+
+    // WHT detection
+    if (/\b(wht|withholding)\b/i.test(text)) {
+      const numMatch = text.match(/[\d,]+/);
+      const amount = numMatch ? parseInt(numMatch[0].replace(/,/g, ""), 10) : 1000000;
+      return { type: "wht", params: { amount, category: "management-resident" } };
+    }
+
+    return null;
+  }
+
+  async function runCalculator(type: string, params: Record<string, number | string>) {
+    const endpoints: Record<string, string> = {
+      paye: "/api/calculations/paye",
+      vat: "/api/calculations/vat",
+      sdl: "/api/calculations/sdl",
+      wht: "/api/calculations/wht",
+    };
+
+    const res = await fetch(endpoints[type], {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+
+    return await res.json();
+  }
+
   async function handleSend(text?: string) {
     const messageText = (text ?? input).trim();
     if (!messageText || isSending) return;
@@ -92,7 +160,48 @@ export default function Home() {
     setInput("");
     setIsSending(true);
 
-    // Add placeholder for streaming response
+    // Check if this is a calculator request
+    const calcRequest = detectCalculatorRequest(messageText);
+
+    if (calcRequest) {
+      try {
+        const calcResult = await runCalculator(calcRequest.type, calcRequest.params);
+        const calcResponse = formatCalculatorResult(calcRequest.type, calcResult);
+
+        const assistantMessage = {
+          id: crypto.randomUUID(),
+          role: "assistant" as const,
+          content: calcResponse,
+          response: {
+            answer: calcResponse,
+            confidence: "high" as const,
+            citations: [],
+            retrievedSources: [],
+            needsHumanReview: false,
+            followUps: [
+              "Calculate PAYE for another amount",
+              "What is the SDL threshold?",
+              "Explain WHT categories",
+            ],
+          },
+          timestamp: Date.now(),
+        };
+        addMessage(convId, assistantMessage);
+      } catch (error) {
+        const errorMessage = {
+          id: crypto.randomUUID(),
+          role: "assistant" as const,
+          content: error instanceof Error ? `Calculation error: ${error.message}` : "Calculation failed",
+          timestamp: Date.now(),
+        };
+        addMessage(convId, errorMessage);
+      } finally {
+        setIsSending(false);
+      }
+      return;
+    }
+
+    // Regular AI chat with streaming
     const assistantId = crypto.randomUUID();
     const assistantMessage = {
       id: assistantId,
@@ -111,9 +220,7 @@ export default function Home() {
 
       if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(
-          "error" in errorData ? errorData.error : "Chat request failed"
-        );
+        throw new Error("error" in errorData ? errorData.error : "Chat request failed");
       }
 
       const reader = response.body?.getReader();
@@ -145,7 +252,6 @@ export default function Home() {
               };
             } else if (data.type === "chunk") {
               fullAnswer += data.text;
-              // Update the assistant message with streaming content
               updateStreamingMessage(convId, assistantId, fullAnswer);
             } else if (data.type === "done") {
               fullAnswer = data.fullAnswer || fullAnswer;
@@ -153,12 +259,11 @@ export default function Home() {
               throw new Error(data.error);
             }
           } catch {
-            // Skip malformed JSON lines
+            /* skip malformed */
           }
         }
       }
 
-      // Finalize the message with metadata
       if (metadata) {
         metadata.answer = fullAnswer;
         updateMessageWithResponse(convId, assistantId, fullAnswer, metadata);
@@ -167,28 +272,20 @@ export default function Home() {
       updateStreamingMessage(
         convId,
         assistantId,
-        error instanceof Error
-          ? `Nimeshindwa kupata jibu sasa hivi: ${error.message}`
-          : "Nimeshindwa kupata jibu sasa hivi."
+        error instanceof Error ? `Nimeshindwa kupata jibu: ${error.message}` : "Nimeshindwa kupata jibu."
       );
     } finally {
       setIsSending(false);
     }
   }
 
-  function updateStreamingMessage(
-    conversationId: string,
-    messageId: string,
-    content: string
-  ) {
+  function updateStreamingMessage(conversationId: string, messageId: string, content: string) {
     useConversationStore.setState((state) => ({
       conversations: state.conversations.map((c) => {
         if (c.id !== conversationId) return c;
         return {
           ...c,
-          messages: c.messages.map((m) =>
-            m.id === messageId ? { ...m, content } : m
-          ),
+          messages: c.messages.map((m) => (m.id === messageId ? { ...m, content } : m)),
           updatedAt: Date.now(),
         };
       }),
@@ -206,9 +303,7 @@ export default function Home() {
         if (c.id !== conversationId) return c;
         return {
           ...c,
-          messages: c.messages.map((m) =>
-            m.id === messageId ? { ...m, content, response } : m
-          ),
+          messages: c.messages.map((m) => (m.id === messageId ? { ...m, content, response } : m)),
           updatedAt: Date.now(),
         };
       }),
@@ -221,18 +316,13 @@ export default function Home() {
   }
 
   function formatTime(ts: number) {
-    return new Date(ts).toLocaleTimeString("en-TZ", {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
+    return new Date(ts).toLocaleTimeString("en-TZ", { hour: "2-digit", minute: "2-digit" });
   }
 
   function formatDateGroup(ts: number) {
     const now = new Date();
     const d = new Date(ts);
-    const diffDays = Math.floor(
-      (now.getTime() - d.getTime()) / (1000 * 60 * 60 * 24)
-    );
+    const diffDays = Math.floor((now.getTime() - d.getTime()) / (1000 * 60 * 60 * 24));
     if (diffDays === 0) return "Today";
     if (diffDays === 1) return "Yesterday";
     if (diffDays < 7) return d.toLocaleDateString("en-TZ", { weekday: "long" });
@@ -251,6 +341,24 @@ export default function Home() {
       groups[groups.length - 1].items.push(conv);
     }
     return groups;
+  }
+
+  // Don't render until client-mounted (fixes hydration)
+  if (!mounted) {
+    return (
+      <div className="appShell">
+        <div className="mainArea">
+          <div className="chatView">
+            <div className="chatEmpty">
+              <div className="emptyLogo">
+                <span className="emptyLogoMark">A</span>
+              </div>
+              <h2>Loading AIMS...</h2>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -288,13 +396,6 @@ export default function Home() {
             <span className="navIcon"> </span> Chats
           </button>
           <button
-            className={`navItem ${view === "calculator" ? "active" : ""}`}
-            onClick={() => setView("calculator")}
-            type="button"
-          >
-            <span className="navIcon"> </span> Calculators
-          </button>
-          <button
             className={`navItem ${view === "documents" ? "active" : ""}`}
             onClick={() => setView("documents")}
             type="button"
@@ -303,7 +404,6 @@ export default function Home() {
           </button>
         </nav>
 
-        {/* Chat History */}
         {view === "chat" && (
           <div className="chatHistory">
             {groupConversations().map((group) => (
@@ -319,18 +419,14 @@ export default function Home() {
                     }}
                   >
                     <span className="chatHistoryTitle">{conv.title}</span>
-                    <span className="chatHistoryCount">
-                      {conv.messages.length} msgs
-                    </span>
+                    <span className="chatHistoryCount">{conv.messages.length}</span>
                     <button
                       className="chatHistoryDelete"
                       onClick={(e) => {
                         e.stopPropagation();
-                        if (confirm("Delete this chat?")) {
-                          deleteConversation(conv.id);
-                        }
+                        if (confirm("Delete this chat?")) deleteConversation(conv.id);
                       }}
-                      title="Delete chat"
+                      title="Delete"
                       type="button"
                     >
                       ×
@@ -356,6 +452,17 @@ export default function Home() {
         </div>
       </aside>
 
+      {/* Mobile sidebar toggle */}
+      {!sidebarOpen && (
+        <button
+          className="mobileSidebarBtn"
+          onClick={() => setSidebarOpen(true)}
+          type="button"
+        >
+          ☰
+        </button>
+      )}
+
       {/* Main Content */}
       <section className="mainArea">
         {view === "chat" && (
@@ -371,12 +478,8 @@ export default function Home() {
             formatTime={formatTime}
           />
         )}
-        {view === "calculator" && <CalculatorView />}
         {view === "documents" && (
-          <DocumentsView
-            documents={documents}
-            onRefresh={loadDocuments}
-          />
+          <DocumentsView documents={documents} onRefresh={loadDocuments} />
         )}
       </section>
     </div>
@@ -407,36 +510,26 @@ function ChatView({
   formatTime: (ts: number) => string;
 }) {
   const messages = conversation?.messages ?? [];
+  const hasMessages = messages.length > 0;
 
   return (
     <div className="chatView">
-      {messages.length === 0 ? (
-        <div className="chatEmpty">
-          <div className="emptyLogo">
-            <span className="emptyLogoMark">A</span>
-          </div>
-          <h2>Naweza kukusaidiaje leo?</h2>
-          <p className="emptySubtext">
-            Ask me about VAT, TIN, PAYE, SDL, corporation tax, compliance, or ERPNext.
-            <br />
-            I use official TRA and PDPC sources only.
-          </p>
-          <div className="promptGrid">
-            {starterPrompts.map((prompt) => (
-              <button
-                className="promptChip"
-                disabled={isSending}
-                key={prompt.text}
-                onClick={() => void onSend(prompt.text)}
-                type="button"
-              >
-                <span className="promptIcon">{prompt.icon}</span>
-                {prompt.text}
-              </button>
-            ))}
-          </div>
+      {/* Persistent header */}
+      <div className="chatHeader">
+        <div className="chatHeaderBrand">
+          <span className="chatHeaderMark">A</span>
+          <span className="chatHeaderName">AIMS</span>
+          <span className="chatHeaderSub">Tanzania Tax &amp; Accounting AI</span>
         </div>
-      ) : (
+        {hasMessages && (
+          <button className="chatHeaderNew" onClick={onNewChat} type="button">
+            + New chat
+          </button>
+        )}
+      </div>
+
+      {hasMessages ? (
+        /* ─── Active conversation ─── */
         <div className="chatTranscript" ref={transcriptRef}>
           <div className="messageStack">
             {messages.map((msg) => (
@@ -445,23 +538,27 @@ function ChatView({
                 key={msg.id}
               >
                 <div className="messageAvatar">
-                  {msg.role === "user" ? "  You" : "A AIMS"}
+                  {msg.role === "user" ? (
+                    <span className="avatarIcon avatarUser">U</span>
+                  ) : (
+                    <span className="avatarIcon avatarAI">A</span>
+                  )}
+                  <span className="avatarLabel">{msg.role === "user" ? "You" : "AIMS"}</span>
                 </div>
                 <div className="messageBody">{msg.content}</div>
-                {msg.response ? (
-                  <ResponseMeta response={msg.response} />
-                ) : null}
+                {msg.response && <ResponseMeta response={msg.response} onSend={onSend} />}
                 <div className="messageTime">{formatTime(msg.timestamp)}</div>
               </article>
             ))}
             {isSending && (
               <article className="message assistantMessage">
-                <div className="messageAvatar">A AIMS</div>
+                <div className="messageAvatar">
+                  <span className="avatarIcon avatarAI">A</span>
+                  <span className="avatarLabel">AIMS</span>
+                </div>
                 <div className="thinkingRow">
                   <div className="thinkingDots" aria-hidden="true">
-                    <span />
-                    <span />
-                    <span />
+                    <span /><span /><span />
                   </div>
                   <span>AIMS inafikiri na kutafuta source rasmi...</span>
                 </div>
@@ -469,9 +566,58 @@ function ChatView({
             )}
           </div>
         </div>
+      ) : (
+        /* ─── Empty state / welcome ─── */
+        <div className="chatEmpty">
+          <div className="emptyLogo">
+            <span className="emptyLogoMark">A</span>
+          </div>
+          <h2>Naweza kukusaidiaje leo?</h2>
+          <p className="emptySubtext">
+            Ask about VAT, TIN, PAYE, SDL, corporation tax, compliance, or ERPNext.
+            <br />
+            I use official TRA and PDPC sources only.
+          </p>
+
+          <div className="promptSection">
+            <div className="promptSectionLabel">Tax &amp; Compliance</div>
+            <div className="promptGrid">
+              {starterPrompts.map((prompt) => (
+                <button
+                  className="promptChip"
+                  disabled={isSending}
+                  key={prompt.text}
+                  onClick={() => void onSend(prompt.text)}
+                  type="button"
+                >
+                  <span className="promptIcon">{prompt.icon}</span>
+                  {prompt.text}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="promptSection">
+            <div className="promptSectionLabel">Quick Calculations</div>
+            <div className="promptGrid">
+              {calculatorPrompts.map((prompt) => (
+                <button
+                  className="promptChip calcChip"
+                  disabled={isSending}
+                  key={prompt.text}
+                  onClick={() => void onSend(prompt.text)}
+                  type="button"
+                >
+                  <span className="promptIcon">{prompt.icon}</span>
+                  {prompt.text}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
       )}
 
-      {/* Composer */}
+      {/* Composer - always at bottom */}
       <div className="composerWrap">
         <form className="composer" onSubmit={onSubmit}>
           <textarea
@@ -483,13 +629,13 @@ function ChatView({
                 e.currentTarget.form?.requestSubmit();
               }
             }}
-            placeholder="Uliza kuhusu VAT, TIN, PAYE, corporation tax..."
+            placeholder="Uliza kuhusu VAT, TIN, PAYE, SDL... au omba hesabu"
             rows={1}
             value={input}
           />
           <div className="composerActions">
             <button
-              aria-label="Send message"
+              aria-label="Send"
               className="sendButton"
               disabled={isSending || !input.trim()}
               type="submit"
@@ -511,35 +657,26 @@ function ChatView({
 
 /* ─── Response Meta ─── */
 
-function ResponseMeta({ response }: { response: ChatResponse }) {
+function ResponseMeta({ response, onSend }: { response: ChatResponse; onSend: (text?: string) => void }) {
   return (
     <div className="responseMeta">
       <div className="responseFlags">
         <span className={`confidence confidence-${response.confidence}`}>
           {response.confidence}
         </span>
-        {response.needsHumanReview ? (
-          <span className="reviewFlag">⚠ Review</span>
-        ) : null}
+        {response.needsHumanReview && <span className="reviewFlag">⚠ Review</span>}
       </div>
 
       {response.citations.length > 0 && (
         <div className="citationList">
           {response.citations.map((citation) => (
             <a
-              href={
-                citation.sourceUrl.startsWith("upload://")
-                  ? "#"
-                  : citation.sourceUrl
-              }
+              href={citation.sourceUrl.startsWith("upload://") ? "#" : citation.sourceUrl}
               key={`${citation.title}-${citation.sourceUrl}`}
               rel="noreferrer"
-              target={
-                citation.sourceUrl.startsWith("upload://") ? undefined : "_blank"
-              }
+              target={citation.sourceUrl.startsWith("upload://") ? undefined : "_blank"}
             >
-              <span className="citationOrg">{citation.sourceOrg}:</span>{" "}
-              {citation.title}
+              <span className="citationOrg">{citation.sourceOrg}:</span> {citation.title}
             </a>
           ))}
         </div>
@@ -548,9 +685,9 @@ function ResponseMeta({ response }: { response: ChatResponse }) {
       {response.followUps.length > 0 && (
         <div className="followUps">
           {response.followUps.slice(0, 3).map((item) => (
-            <span className="followUpChip" key={item}>
+            <button className="followUpChip" key={item} onClick={() => void onSend(item)} type="button">
               {item}
-            </span>
+            </button>
           ))}
         </div>
       )}
@@ -558,205 +695,65 @@ function ResponseMeta({ response }: { response: ChatResponse }) {
   );
 }
 
-/* ─── Calculator View ─── */
+/* ─── Calculator Result Formatter ─── */
 
-function CalculatorView() {
-  return (
-    <div className="panelView">
-      <div className="viewHeader">
-        <h1>  Tax Calculators</h1>
-        <p>
-          Deterministic calculators using official Tanzania tax rules. AI
-          haifanyi hesabu mwenyewe.
-        </p>
-      </div>
-      <div className="panelGrid">
-        <PayeCalculator />
-        <VatCalculator />
-        <SdlCalculator />
-        <WhtCalculator />
-      </div>
-    </div>
-  );
-}
+function formatCalculatorResult(type: string, result: Record<string, unknown>): string {
+  const fmt = (v: unknown) => new Intl.NumberFormat("en-TZ").format(Number(v));
 
-function PayeCalculator() {
-  const [income, setIncome] = useState("600000");
-  const [result, setResult] = useState<PayeResponse | null>(null);
-  const [error, setError] = useState("");
+  switch (type) {
+    case "paye":
+      return `  **PAYE Calculation Result**
 
-  async function calculate() {
-    setError("");
-    const res = await fetch("/api/calculations/paye", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ monthlyTaxableIncome: Number(income) }),
-    });
-    const data = (await res.json()) as PayeResponse | { error: string };
-    if (!res.ok || "error" in data) {
-      setError("error" in data ? data.error : "Calculation failed");
-      return;
+**Monthly Taxable Income:** TZS ${fmt(result.monthlyTaxableIncome)}
+**PAYE:** TZS ${fmt(result.paye)}
+**Effective Rate:** ${(Number(result.effectiveRate) * 100).toFixed(2)}%
+
+  Rule: ${result.ruleVersion}
+  Note: Based on TRA mainland monthly PAYE bands. Annual threshold TZS 3,240,000 is not taxable.
+
+  Want me to explain how PAYE bands work, or calculate for a different amount?`;
+
+    case "vat":
+      return `  **VAT Calculation Result**
+
+**Amount:** TZS ${fmt(result.amount)}
+**VAT (18%):** TZS ${fmt(result.vatAmount)}
+**Net:** TZS ${fmt(result.net)}
+**Total:** TZS ${fmt(result.total)}
+
+  Rule: ${result.ruleVersion}
+
+  Do you need to calculate VAT for a different amount, or want to know about VAT returns?`;
+
+    case "sdl": {
+      const applicable = result.applicable ? "Yes" : "No";
+      return `  **SDL Calculation Result**
+
+**Total Gross Emoluments:** TZS ${fmt(result.totalGrossEmoluments)}
+**Employee Count:** ${result.employeeCount}
+**SDL Applicable:** ${applicable}
+**SDL Amount:** TZS ${fmt(result.sdl)}
+**Rate:** ${(Number(result.rate) * 100).toFixed(1)}%
+
+  ${result.note}
+
+  Need help with other payroll calculations?`;
     }
-    setResult(data);
+
+    case "wht":
+      return `  **WHT Calculation Result**
+
+**Payment Amount:** TZS ${fmt(result.amount)}
+**Category:** ${result.label}
+**Rate:** ${(Number(result.rate) * 100).toFixed(0)}%
+**WHT:** TZS ${fmt(result.wht)}
+**Net Payable:** TZS ${fmt(result.netPayable)}
+
+  Do you need to calculate WHT for a different category or amount?`;
+
+    default:
+      return JSON.stringify(result, null, 2);
   }
-
-  return (
-    <CalculatorCard onCalculate={calculate} title="PAYE">
-      <label>
-        Monthly taxable income (TZS)
-        <input onChange={(e) => setIncome(e.target.value)} type="number" value={income} />
-      </label>
-      {error && <p className="calcError">{error}</p>}
-      {result && (
-        <div className="resultBox">
-          <strong>TZS {fmt(result.paye)}</strong>
-          Effective rate: {(result.effectiveRate * 100).toFixed(2)}%
-          <br />
-          Rule: {result.ruleVersion}
-        </div>
-      )}
-    </CalculatorCard>
-  );
-}
-
-function VatCalculator() {
-  const [amount, setAmount] = useState("1000000");
-  const [mode, setMode] = useState<"exclusive" | "inclusive">("exclusive");
-  const [result, setResult] = useState<VatResponse | null>(null);
-
-  async function calculate() {
-    const res = await fetch("/api/calculations/vat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ amount: Number(amount), mode }),
-    });
-    setResult((await res.json()) as VatResponse);
-  }
-
-  return (
-    <CalculatorCard onCalculate={calculate} title="VAT (18%)">
-      <label>
-        Amount (TZS)
-        <input onChange={(e) => setAmount(e.target.value)} type="number" value={amount} />
-      </label>
-      <label>
-        Mode
-        <select onChange={(e) => setMode(e.target.value as "exclusive" | "inclusive")} value={mode}>
-          <option value="exclusive">Amount is exclusive of VAT</option>
-          <option value="inclusive">Amount is inclusive of VAT</option>
-        </select>
-      </label>
-      {result && (
-        <div className="resultBox">
-          <strong>VAT: TZS {fmt(result.vatAmount)}</strong>
-          Net: TZS {fmt(result.net)} | Total: TZS {fmt(result.total)}
-        </div>
-      )}
-    </CalculatorCard>
-  );
-}
-
-function SdlCalculator() {
-  const [payroll, setPayroll] = useState("5000000");
-  const [employees, setEmployees] = useState("12");
-  const [result, setResult] = useState<SdlResponse | null>(null);
-
-  async function calculate() {
-    const res = await fetch("/api/calculations/sdl", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        totalGrossEmoluments: Number(payroll),
-        employeeCount: Number(employees),
-      }),
-    });
-    setResult((await res.json()) as SdlResponse);
-  }
-
-  return (
-    <CalculatorCard onCalculate={calculate} title="SDL">
-      <label>
-        Total gross emoluments (TZS)
-        <input onChange={(e) => setPayroll(e.target.value)} type="number" value={payroll} />
-      </label>
-      <label>
-        Employee count
-        <input onChange={(e) => setEmployees(e.target.value)} type="number" value={employees} />
-      </label>
-      {result && (
-        <div className="resultBox">
-          <strong>TZS {fmt(result.sdl)}</strong>
-          Applicable: {result.applicable ? "Yes" : "No"} | Rate: {(result.rate * 100).toFixed(1)}%
-          <br />
-          {result.note}
-        </div>
-      )}
-    </CalculatorCard>
-  );
-}
-
-function WhtCalculator() {
-  const [amount, setAmount] = useState("1000000");
-  const [category, setCategory] = useState("management-resident");
-  const [result, setResult] = useState<WhtResponse | null>(null);
-
-  async function calculate() {
-    const res = await fetch("/api/calculations/wht", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ amount: Number(amount), category }),
-    });
-    setResult((await res.json()) as WhtResponse);
-  }
-
-  return (
-    <CalculatorCard onCalculate={calculate} title="WHT">
-      <label>
-        Payment amount (TZS)
-        <input onChange={(e) => setAmount(e.target.value)} type="number" value={amount} />
-      </label>
-      <label>
-        Category
-        <select onChange={(e) => setCategory(e.target.value)} value={category}>
-          <option value="dividends-resident">Dividends (resident) - 5%</option>
-          <option value="dividends-non-resident">Dividends (non-resident) - 10%</option>
-          <option value="interest">Interest - 15%</option>
-          <option value="royalties">Royalties - 15%</option>
-          <option value="management-resident">Management/consultancy (resident) - 5%</option>
-          <option value="management-non-resident">Management/consultancy (non-resident) - 15%</option>
-          <option value="rent-resident">Rent (resident) - 10%</option>
-        </select>
-      </label>
-      {result && (
-        <div className="resultBox">
-          <strong>WHT: TZS {fmt(result.wht)}</strong>
-          Net payable: TZS {fmt(result.netPayable)}
-          <br />
-          {result.label} @ {(result.rate * 100).toFixed(0)}%
-        </div>
-      )}
-    </CalculatorCard>
-  );
-}
-
-function CalculatorCard({
-  title,
-  children,
-  onCalculate,
-}: {
-  title: string;
-  children: React.ReactNode;
-  onCalculate: () => void;
-}) {
-  return (
-    <article className="panelCard">
-      <h2>{title}</h2>
-      <div className="fieldGrid">{children}</div>
-      <button className="primaryButton" onClick={() => void onCalculate()} type="button">
-        Calculate
-      </button>
-    </article>
-  );
 }
 
 /* ─── Documents View ─── */
@@ -787,21 +784,12 @@ function DocumentsView({
       formData.append("title", uploadTitle);
       formData.append("tags", uploadTags);
 
-      const res = await fetch("/api/documents", {
-        method: "POST",
-        body: formData,
-      });
-      const data = (await res.json()) as {
-        message?: string;
-        error?: string;
-        entriesCreated?: number;
-      };
+      const res = await fetch("/api/documents", { method: "POST", body: formData });
+      const data = (await res.json()) as { message?: string; error?: string; entriesCreated?: number };
 
       if (!res.ok) throw new Error(data.error ?? "Upload failed");
 
-      setUploadStatus(
-        `${data.message ?? "Uploaded"} (${data.entriesCreated ?? 0} chunks indexed).`
-      );
+      setUploadStatus(`${data.message ?? "Uploaded"} (${data.entriesCreated ?? 0} chunks indexed).`);
       setUploadFile(null);
       setUploadTitle("");
       await onRefresh();
@@ -813,9 +801,7 @@ function DocumentsView({
   }
 
   async function handleRemove(id: string) {
-    await fetch(`/api/documents?id=${encodeURIComponent(id)}`, {
-      method: "DELETE",
-    });
+    await fetch(`/api/documents?id=${encodeURIComponent(id)}`, { method: "DELETE" });
     await onRefresh();
   }
 
@@ -823,36 +809,22 @@ function DocumentsView({
     <div className="panelView">
       <div className="viewHeader">
         <h1>  Legal Documents</h1>
-        <p>
-          Pakia PDF za TRA, Finance Act, regulations, notices, na legal docs
-          nyingine.
-        </p>
+        <p>Pakia PDF za TRA, Finance Act, regulations, na legal docs nyingine.</p>
       </div>
 
       <article className="panelCard uploadCard">
         <form onSubmit={handleUpload}>
           <div className="uploadZone">
-            <p>Drag & drop au chagua PDF ya legal/tax document</p>
-            <label className="uploadLabel" htmlFor="pdf-upload">
-              + Chagua PDF
-            </label>
-            <input
-              accept="application/pdf,.pdf"
-              id="pdf-upload"
-              onChange={(e) => setUploadFile(e.target.files?.[0] ?? null)}
-              type="file"
-            />
+            <p>Drag & drop au chagua PDF</p>
+            <label className="uploadLabel" htmlFor="pdf-upload">+ Chagua PDF</label>
+            <input accept="application/pdf,.pdf" id="pdf-upload" onChange={(e) => setUploadFile(e.target.files?.[0] ?? null)} type="file" />
             {uploadFile && <span className="uploadFileName">{uploadFile.name}</span>}
           </div>
 
           <div className="fieldGrid" style={{ marginTop: 16 }}>
             <label>
               Document title (optional)
-              <input
-                onChange={(e) => setUploadTitle(e.target.value)}
-                placeholder="Finance Act 2026"
-                value={uploadTitle}
-              />
+              <input onChange={(e) => setUploadTitle(e.target.value)} placeholder="Finance Act 2026" value={uploadTitle} />
             </label>
             <label>
               Tags (comma separated)
@@ -860,11 +832,7 @@ function DocumentsView({
             </label>
           </div>
 
-          <button
-            className="primaryButton"
-            disabled={!uploadFile || isUploading}
-            type="submit"
-          >
+          <button className="primaryButton" disabled={!uploadFile || isUploading} type="submit">
             {isUploading ? "Inapakia..." : "Upload & Index PDF"}
           </button>
 
@@ -873,10 +841,7 @@ function DocumentsView({
 
         <div className="documentList">
           {documents.length === 0 ? (
-            <div className="resultBox">
-              Hakuna documents bado. Pakia PDF ya kwanza ili AI iweze kujibu
-              maswali kutoka kwake.
-            </div>
+            <div className="resultBox">Hakuna documents bado.</div>
           ) : (
             documents.map((doc) => (
               <div className="documentRow" key={doc.id}>
@@ -891,11 +856,7 @@ function DocumentsView({
                     </span>
                   </small>
                 </div>
-                <button
-                  className="dangerButton"
-                  onClick={() => void handleRemove(doc.id)}
-                  type="button"
-                >
+                <button className="dangerButton" onClick={() => void handleRemove(doc.id)} type="button">
                   Remove
                 </button>
               </div>
@@ -906,8 +867,6 @@ function DocumentsView({
     </div>
   );
 }
-
-/* ─── Helpers ─── */
 
 function fmt(value: number) {
   return new Intl.NumberFormat("en-TZ").format(value);
