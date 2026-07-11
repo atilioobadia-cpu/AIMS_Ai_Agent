@@ -229,6 +229,7 @@ export default function Home() {
       const decoder = new TextDecoder();
       let fullAnswer = "";
       let metadata: ChatResponse | null = null;
+      let streamError: string | null = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -238,30 +239,41 @@ export default function Home() {
         const lines = text.split("\n").filter((l) => l.startsWith("data: "));
 
         for (const line of lines) {
+          let parsed: Record<string, unknown> | null = null;
           try {
-            const data = JSON.parse(line.slice(6));
-
-            if (data.type === "metadata") {
-              metadata = {
-                answer: "",
-                confidence: data.confidence,
-                citations: data.citations,
-                retrievedSources: [],
-                needsHumanReview: data.needsHumanReview,
-                followUps: data.followUps,
-              };
-            } else if (data.type === "chunk") {
-              fullAnswer += data.text;
-              updateStreamingMessage(convId, assistantId, fullAnswer);
-            } else if (data.type === "done") {
-              fullAnswer = data.fullAnswer || fullAnswer;
-            } else if (data.type === "error") {
-              throw new Error(data.error);
-            }
+            parsed = JSON.parse(line.slice(6)) as Record<string, unknown>;
           } catch {
-            /* skip malformed */
+            /* skip malformed JSON lines */
+          }
+          if (!parsed) continue;
+
+          if (parsed.type === "error") {
+            streamError = String(parsed.error ?? "Unknown stream error");
+            break;
+          }
+
+          if (parsed.type === "metadata") {
+            metadata = {
+              answer: "",
+              confidence: parsed.confidence as ChatResponse["confidence"],
+              citations: parsed.citations as ChatResponse["citations"],
+              retrievedSources: [],
+              needsHumanReview: Boolean(parsed.needsHumanReview),
+              followUps: parsed.followUps as string[],
+            };
+          } else if (parsed.type === "chunk") {
+            fullAnswer += parsed.text;
+            updateStreamingMessage(convId, assistantId, fullAnswer);
+          } else if (parsed.type === "done") {
+            fullAnswer = (String(parsed.fullAnswer)) || fullAnswer;
           }
         }
+
+        if (streamError) break;
+      }
+
+      if (streamError) {
+        throw new Error(streamError);
       }
 
       if (metadata) {
@@ -351,7 +363,7 @@ export default function Home() {
           <div className="chatView">
             <div className="chatEmpty">
               <div className="emptyLogo">
-                <span className="emptyLogoMark">A</span>
+                <img src="/aims-logo.png" alt="AIMS" className="emptyLogoImg" />
               </div>
               <h2>Loading AIMS...</h2>
             </div>
@@ -367,7 +379,7 @@ export default function Home() {
       <aside className={`sidebar ${sidebarOpen ? "open" : "closed"}`} aria-label="Navigation">
         <div className="sidebarTop">
           <div className="brand">
-            <span className="brandMark">A</span>
+            <img src="/aims-logo.png" alt="AIMS" className="brandMarkImg" />
             <div className="brandText">
               <strong>AIMS</strong>
               <span>AI Tax Agent</span>
@@ -517,7 +529,7 @@ function ChatView({
       {/* Persistent header */}
       <div className="chatHeader">
         <div className="chatHeaderBrand">
-          <span className="chatHeaderMark">A</span>
+          <img src="/aims-logo.png" alt="AIMS" className="chatHeaderLogo" />
           <span className="chatHeaderName">AIMS</span>
           <span className="chatHeaderSub">Tanzania Tax &amp; Accounting AI</span>
         </div>
@@ -570,7 +582,7 @@ function ChatView({
         /* ─── Empty state / welcome ─── */
         <div className="chatEmpty">
           <div className="emptyLogo">
-            <span className="emptyLogoMark">A</span>
+            <img src="/aims-logo.png" alt="AIMS" className="emptyLogoImg" />
           </div>
           <h2>Naweza kukusaidiaje leo?</h2>
           <p className="emptySubtext">
