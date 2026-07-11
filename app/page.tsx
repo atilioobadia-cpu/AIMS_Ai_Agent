@@ -92,40 +92,127 @@ export default function Home() {
     setInput("");
     setIsSending(true);
 
+    // Add placeholder for streaming response
+    const assistantId = crypto.randomUUID();
+    const assistantMessage = {
+      id: assistantId,
+      role: "assistant" as const,
+      content: "",
+      timestamp: Date.now(),
+    };
+    addMessage(convId, assistantMessage);
+
     try {
-      const response = await fetch("/api/chat", {
+      const response = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: messageText }),
       });
-      const data = (await response.json()) as ChatResponse | { error: string };
 
-      if (!response.ok || "error" in data) {
-        throw new Error("error" in data ? data.error : "Chat request failed");
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(
+          "error" in errorData ? errorData.error : "Chat request failed"
+        );
       }
 
-      const assistantMessage = {
-        id: crypto.randomUUID(),
-        role: "assistant" as const,
-        content: data.answer,
-        response: data,
-        timestamp: Date.now(),
-      };
-      addMessage(convId, assistantMessage);
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("No response body");
+
+      const decoder = new TextDecoder();
+      let fullAnswer = "";
+      let metadata: ChatResponse | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const text = decoder.decode(value);
+        const lines = text.split("\n").filter((l) => l.startsWith("data: "));
+
+        for (const line of lines) {
+          try {
+            const data = JSON.parse(line.slice(6));
+
+            if (data.type === "metadata") {
+              metadata = {
+                answer: "",
+                confidence: data.confidence,
+                citations: data.citations,
+                retrievedSources: [],
+                needsHumanReview: data.needsHumanReview,
+                followUps: data.followUps,
+              };
+            } else if (data.type === "chunk") {
+              fullAnswer += data.text;
+              // Update the assistant message with streaming content
+              updateStreamingMessage(convId, assistantId, fullAnswer);
+            } else if (data.type === "done") {
+              fullAnswer = data.fullAnswer || fullAnswer;
+            } else if (data.type === "error") {
+              throw new Error(data.error);
+            }
+          } catch {
+            // Skip malformed JSON lines
+          }
+        }
+      }
+
+      // Finalize the message with metadata
+      if (metadata) {
+        metadata.answer = fullAnswer;
+        updateMessageWithResponse(convId, assistantId, fullAnswer, metadata);
+      }
     } catch (error) {
-      const errorMessage = {
-        id: crypto.randomUUID(),
-        role: "assistant" as const,
-        content:
-          error instanceof Error
-            ? `Nimeshindwa kupata jibu sasa hivi: ${error.message}`
-            : "Nimeshindwa kupata jibu sasa hivi.",
-        timestamp: Date.now(),
-      };
-      addMessage(convId, errorMessage);
+      updateStreamingMessage(
+        convId,
+        assistantId,
+        error instanceof Error
+          ? `Nimeshindwa kupata jibu sasa hivi: ${error.message}`
+          : "Nimeshindwa kupata jibu sasa hivi."
+      );
     } finally {
       setIsSending(false);
     }
+  }
+
+  function updateStreamingMessage(
+    conversationId: string,
+    messageId: string,
+    content: string
+  ) {
+    useConversationStore.setState((state) => ({
+      conversations: state.conversations.map((c) => {
+        if (c.id !== conversationId) return c;
+        return {
+          ...c,
+          messages: c.messages.map((m) =>
+            m.id === messageId ? { ...m, content } : m
+          ),
+          updatedAt: Date.now(),
+        };
+      }),
+    }));
+  }
+
+  function updateMessageWithResponse(
+    conversationId: string,
+    messageId: string,
+    content: string,
+    response: ChatResponse
+  ) {
+    useConversationStore.setState((state) => ({
+      conversations: state.conversations.map((c) => {
+        if (c.id !== conversationId) return c;
+        return {
+          ...c,
+          messages: c.messages.map((m) =>
+            m.id === messageId ? { ...m, content, response } : m
+          ),
+          updatedAt: Date.now(),
+        };
+      }),
+    }));
   }
 
   function handleSubmit(e: FormEvent) {
