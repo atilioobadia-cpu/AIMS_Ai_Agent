@@ -138,11 +138,22 @@ export async function POST(request: NextRequest) {
           controller.close();
         } catch (error) {
           console.error("Stream error:", error);
-          const errorMessage =
-            error instanceof Error ? error.message : "Unknown error";
+          const raw = error instanceof Error ? error.message : "Unknown error";
+
+          let friendlyMessage: string;
+          if (/429|quota|rate.?limit|too many requests/i.test(raw)) {
+            friendlyMessage = "You've hit the API rate limit. Please wait a moment and try again.";
+          } else if (/401|403|api.?key|unauthorized/i.test(raw)) {
+            friendlyMessage = "API key issue. Please check your Gemini API key in .env.local.";
+          } else if (/fetch.*failed|network|ECONNREFUSED/i.test(raw)) {
+            friendlyMessage = "Network error. Please check your internet connection.";
+          } else {
+            friendlyMessage = "Something went wrong. Please try again.";
+          }
+
           controller.enqueue(
             encoder.encode(
-              `data: ${JSON.stringify({ type: "error", error: errorMessage })}\n\n`
+              `data: ${JSON.stringify({ type: "error", error: friendlyMessage })}\n\n`
             )
           );
           controller.close();
